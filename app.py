@@ -143,16 +143,29 @@ refresh_interval = st.sidebar.number_input("Refresh Interval (seconds)", min_val
 
 # --- Instruments Data Synchronization ---
 INSTRUMENTS_FILE = 'api-scrip-master.csv'
+INSTRUMENTS_FILE_GZ = 'api-scrip-master.csv.gz'
 CACHE_FILE = 'instruments_cache.pkl'
 
+def get_active_instruments_file():
+    """Returns the path of the available instruments file (CSV or GZ)."""
+    if os.path.exists(INSTRUMENTS_FILE):
+        return INSTRUMENTS_FILE
+    elif os.path.exists(INSTRUMENTS_FILE_GZ):
+        return INSTRUMENTS_FILE_GZ
+    return None
+
 def get_file_date(filepath):
-    if not os.path.exists(filepath):
+    if not filepath or not os.path.exists(filepath):
         return None
     return datetime.datetime.fromtimestamp(os.path.getmtime(filepath)).date()
 
-def is_file_fresh(filepath):
-    """Check if file exists and is from today"""
-    f_date = get_file_date(filepath)
+def is_file_fresh():
+    """Check if we have a valid file from today"""
+    active_file = get_active_instruments_file()
+    if not active_file:
+        return False
+    
+    f_date = get_file_date(active_file)
     if f_date:
         return f_date == datetime.date.today()
     return False
@@ -173,10 +186,7 @@ def download_scrip_master():
     except Exception as e:
         return False, str(e)
 
-file_date = get_file_date(INSTRUMENTS_FILE)
-is_fresh = False
-if file_date:
-    is_fresh = (file_date == datetime.date.today())
+is_fresh = is_file_fresh()
 
 # Auto-download if missing or not fresh
 if not is_fresh:
@@ -193,15 +203,22 @@ if not is_fresh:
         status_placeholder.success(f"✅ Updated Scrip Master ({get_today_str()})")
         is_fresh = True
     else:
-        status_placeholder.error(f"❌ Auto-download failed: {msg}")
+        # If download failed but we have a GZ file (even if old), use it as fallback
+        if get_active_instruments_file():
+             status_placeholder.warning(f"⚠️ Auto-download failed: {msg}. Using existing data.")
+             is_fresh = True
+        else:
+             status_placeholder.error(f"❌ Auto-download failed: {msg}")
 
-# Display status if fresh (or became fresh)
-if is_fresh:
-    st.sidebar.success(f"✅ Scrip Master: Up to date")
-    st.sidebar.caption(f"Date: {get_today_str()}")
+# Display status
+active_file = get_active_instruments_file()
+if is_fresh and active_file:
+    f_date = get_file_date(active_file)
+    st.sidebar.success(f"✅ Scrip Master: Ready")
+    st.sidebar.caption(f"Date: {f_date} (Source: {active_file})")
 else:
     # Fallback UI if download failed
-    if st.sidebar.button("� Retry Download"):
+    if st.sidebar.button("🔄 Retry Download"):
         with st.sidebar.status("Retrying..."):
             success, msg = download_scrip_master()
             if success:
@@ -238,17 +255,18 @@ def load_data():
     df = None
     
     # 1. Try to load from fast pickle cache first
-    if is_file_fresh(CACHE_FILE):
+    if os.path.exists(CACHE_FILE):
         try:
             df = pd.read_pickle(CACHE_FILE)
-            # print("DEBUG: Loaded from Pickle Cache")
         except Exception:
             df = None
 
-    # 2. If no cache, load from CSV
+    # 2. If no cache, load from CSV/GZ
     if df is None:
-        if not os.path.exists(INSTRUMENTS_FILE):
-            st.error(f"Instruments file not found: {INSTRUMENTS_FILE}")
+        file_to_read = get_active_instruments_file()
+        
+        if not file_to_read:
+            st.error(f"Instruments file not found. Please download or upload 'api-scrip-master.csv'.")
             return pd.DataFrame(), pd.DataFrame()
 
         # Load and Filter CSV directly
@@ -268,16 +286,20 @@ def load_data():
             chunk_list = []
             chunk_size = 50000
             
+            # Check compression
+            compression = 'gzip' if file_to_read.endswith('.gz') else None
+            
             # Read in chunks to filter efficiently
-            for chunk in pd.read_csv(INSTRUMENTS_FILE, usecols=usecols, chunksize=chunk_size):
-                # Filter for NSE Derivatives (NSE FO)
-                # SEM_EXM_EXCH_ID == 'NSE' and SEM_SEGMENT == 'D'
-                filtered = chunk[
-                    (chunk['SEM_EXM_EXCH_ID'] == 'NSE') & 
-                    (chunk['SEM_SEGMENT'] == 'D')
-                ]
-                if not filtered.empty:
-                    chunk_list.append(filtered)
+            with pd.read_csv(file_to_read, usecols=usecols, chunksize=chunk_size, low_memory=False, compression=compression) as reader:
+                for chunk in reader:
+                    # Filter for NSE Derivatives (NSE FO)
+                    # SEM_EXM_EXCH_ID == 'NSE' and SEM_SEGMENT == 'D'
+                    filtered = chunk[
+                        (chunk['SEM_EXM_EXCH_ID'] == 'NSE') & 
+                        (chunk['SEM_SEGMENT'] == 'D')
+                    ]
+                    if not filtered.empty:
+                        chunk_list.append(filtered)
             
             if not chunk_list:
                 return pd.DataFrame(), pd.DataFrame()
